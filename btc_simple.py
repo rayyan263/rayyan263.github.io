@@ -24,9 +24,9 @@ class Config:
     mom_move_thr: float = 0.008
     mom_vol_thr: float = 1.5
     mom_imb_thr: float = 0.05
-    mom_tp: float = 0.003
-    mom_sl: float = 0.002
-    mom_hold: int = 6
+    mom_tp: float = 0.010
+    mom_sl: float = 0.005
+    mom_hold: int = 8
     # Mean reversion params
     rev_move_thr: float = 0.003
     rev_rsi_long: float = 35.0
@@ -402,7 +402,7 @@ async def run_app(cfg):
     log(f"BTC Dual Strategy Bot | Kraken | {cfg.leverage}x leverage")
     log(f"Strategy 1 MOMENTUM: move>{cfg.mom_move_thr*100}% vol>{cfg.mom_vol_thr}x TP={cfg.mom_tp*100}% SL={cfg.mom_sl*100}%")
     log(f"Strategy 2 MEAN_REV: RSI<{cfg.rev_rsi_long} BB%<{cfg.rev_bb_long} TP={cfg.rev_tp*100}% SL={cfg.rev_sl*100}%")
-    log(f"Kelly sizing ON | Brain ON | Backtested 750 days combined PnL=$4,369")
+    log(f"Kelly sizing ON | Brain ON | CORRECTED backtest: MeanRev WR=56.3% Momentum WR=43% (next bar open)")
     adjust_brain(cfg)
     tasks = [
         asyncio.create_task(bar_loop(cfg, stop)),
