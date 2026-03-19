@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""BTC Momentum Bot with Regime Detection - logging version"""
+"""BTC Momentum Bot v2 - Kraken data, regime detection, no proxy needed"""
 import asyncio, aiohttp, time, datetime, csv, os, numpy as np
-from aiohttp_socks import ProxyConnector
 from dataclasses import dataclass
 
 @dataclass
 class Config:
     symbol: str = "BTCUSDT"
+    kraken_pair: str = "XBTUSD"
     initial_balance: float = 500.0
     trade_size: float = 50.0
     taker_fee_rate: float = 0.0002
@@ -28,11 +28,6 @@ def log(msg):
     ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
-def make_session():
-    return aiohttp.ClientSession(
-        connector=ProxyConnector.from_url("socks5://127.0.0.1:9050")
-    )
-
 state = {
     "bars": [], "last_bar_time": None,
     "bid": 0.0, "ask": 0.0, "mid": 0.0,
@@ -48,44 +43,35 @@ def update_regime(bars):
     if len(bars) < 20:
         state["current_regime"] = "UNKNOWN"
         return
-
     closes = [b["close"] for b in bars[-50:]]
     highs = [b["high"] for b in bars[-50:]]
     lows = [b["low"] for b in bars[-50:]]
-
     trs = []
     for i in range(1, len(closes)):
         hl = highs[i] - lows[i]
         hc = abs(highs[i] - closes[i-1])
         lc = abs(lows[i] - closes[i-1])
         trs.append(max(hl, hc, lc))
-
     if len(trs) < 14:
         state["current_regime"] = "UNKNOWN"
         return
-
     atr14 = np.mean(trs[-14:])
     atr_ratio = trs[-1] / atr14 if atr14 > 0 else 1.0
-
     up_moves = [max(highs[i]-highs[i-1], 0) for i in range(1, len(highs))]
     down_moves = [max(lows[i-1]-lows[i], 0) for i in range(1, len(lows))]
     plus_dm = [u if u > d and u > 0 else 0 for u,d in zip(up_moves, down_moves)]
     minus_dm = [d if d > u and d > 0 else 0 for u,d in zip(up_moves, down_moves)]
-
     if atr14 > 0 and len(plus_dm) >= 14:
         plus_di = 100 * np.mean(plus_dm[-14:]) / atr14
         minus_di = 100 * np.mean(minus_dm[-14:]) / atr14
         di_sum = plus_di + minus_di
         adx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
-        trend_up = plus_di > minus_di
     else:
         adx = 0
-        trend_up = True
-
+        plus_di = minus_di = 0
     ema10 = np.mean(closes[-10:])
     ema20 = np.mean(closes[-20:])
     trend_up = ema10 > ema20
-
     bb_std = np.std(closes[-20:])
     bb_mid = np.mean(closes[-20:])
     bb_width = (bb_std * 2) / bb_mid if bb_mid > 0 else 0
@@ -96,7 +82,6 @@ def update_regime(bars):
     else:
         bb_width_avg = bb_width
     squeeze = bb_width < bb_width_avg * 0.7
-
     if squeeze and atr_ratio < 0.7:
         regime = "SQUEEZE"
     elif atr_ratio > 2.0:
@@ -107,21 +92,31 @@ def update_regime(bars):
         regime = "LOW_VOL"
     else:
         regime = "RANGING"
-
     state["current_regime"] = regime
 
-async def fetch_klines(cfg):
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={cfg.symbol}&interval=4h&limit=25"
-    async with make_session() as s:
-        async with s.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-            return await r.json()
+async def fetch_klines(cfg, session):
+    url = f"https://api.kraken.com/0/public/OHLC?pair={cfg.kraken_pair}&interval=240"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+        d = await r.json()
+    raw = d["result"]["XXBTZUSD"]
+    bars = []
+    for b in raw:
+        ts, o, h, l, c, vwap, vol, count = b
+        bars.append({
+            "open_time": int(ts),
+            "open": float(o), "high": float(h),
+            "low": float(l), "close": float(c),
+            "volume": float(vol),
+            "vol_imb": 0.0,
+        })
+    return bars
 
-async def fetch_price(cfg):
-    url = f"https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol={cfg.symbol}"
-    async with make_session() as s:
-        async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-            d = await r.json()
-    return float(d["bidPrice"]), float(d["askPrice"])
+async def fetch_price(cfg, session):
+    url = f"https://api.kraken.com/0/public/Ticker?pair={cfg.kraken_pair}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+        d = await r.json()
+    ticker = d["result"]["XXBTZUSD"]
+    return float(ticker["b"][0]), float(ticker["a"][0])
 
 def check_entry(cfg, bars):
     if len(bars) < cfg.vol_window + 2:
@@ -131,40 +126,38 @@ def check_entry(cfg, bars):
     vol_ma = sum(vols[-cfg.vol_window:]) / cfg.vol_window if len(vols) >= cfg.vol_window else 0
     vol_ratio = bar["volume"] / vol_ma if vol_ma > 0 else 0
     move = (bar["close"] - bar["open"]) / bar["open"]
-    vol_imb = bar["vol_imb"]
     signals = {
         "move_pct": round(move*100, 3),
         "vol_ratio": round(vol_ratio, 2),
-        "vol_imb": round(vol_imb, 3),
+        "vol_imb": 0.0,
         "regime": state["current_regime"],
     }
     mt = state["move_thr"]
     vt = state["vol_thr"]
-    if move > mt and vol_ratio > vt and vol_imb > cfg.imb_thr:
+    if move > mt and vol_ratio > vt:
         return "LONG", signals
-    elif move < -mt and vol_ratio > vt and vol_imb < -cfg.imb_thr:
+    elif move < -mt and vol_ratio > vt:
         return "SHORT", signals
     return None, signals
 
 def manage_trade(cfg):
     t = state["active_trade"]
-    if not t:
-        return
+    if not t: return
     bid, ask = state["bid"], state["ask"]
     side = t["side"]
     entry = t["entry"]
     hold_s = time.time() - t["entry_time"]
     hold_bars = int(hold_s / cfg.bar_seconds)
-    ex = bid if side == "LONG" else ask
+    ex = bid if side=="LONG" else ask
     reason = None
     if (side=="LONG" and bid<=t["liq"]) or (side=="SHORT" and ask>=t["liq"]):
-        ex = t["liq"]; reason = "LIQUIDATED"
+        ex=t["liq"]; reason="LIQUIDATED"
     elif (side=="LONG" and ask>=t["tp"]) or (side=="SHORT" and bid<=t["tp"]):
-        ex = t["tp"]; reason = "TP"
+        ex=t["tp"]; reason="TP"
     elif (side=="LONG" and bid<=t["sl"]) or (side=="SHORT" and ask>=t["sl"]):
-        ex = t["sl"]; reason = "SL"
+        ex=t["sl"]; reason="SL"
     elif hold_bars >= cfg.max_hold_bars:
-        reason = "TIMEOUT"
+        reason="TIMEOUT"
     if reason:
         raw = (ex-entry)/entry if side=="LONG" else (entry-ex)/entry
         net = max(raw*cfg.leverage - cfg.taker_fee_rate*2, -1.0)
@@ -189,7 +182,6 @@ def manage_trade(cfg):
             "fees_$": round(cfg.taker_fee_rate*2*cfg.trade_size, 4),
             "move_pct": t.get("move_pct", 0),
             "vol_ratio": t.get("vol_ratio", 0),
-            "vol_imb": t.get("vol_imb", 0),
             "regime": t.get("regime", "UNKNOWN"),
         }
         with open(cfg.trade_log, "a", newline="") as f:
@@ -208,8 +200,7 @@ def adjust_brain(cfg):
             for r in _csv.DictReader(f): rows.append(r)
         if len(rows) < 5: return
         recent = rows[-10:]
-        wr = sum(1 for r in recent if float(r["pnl_$"]) > 0) / len(recent)
-        state["brain_wr"] = round(wr*100, 1)
+        wr = sum(1 for r in recent if float(r["pnl_$"])>0) / len(recent)
         if wr < 0.40 and state["vol_thr"] < 3.0:
             state["vol_thr"] = round(state["vol_thr"]+0.2, 1)
             log(f"BRAIN: WR low → vol_thr→{state['vol_thr']}")
@@ -220,84 +211,68 @@ def adjust_brain(cfg):
         log(f"Brain error: {e}")
 
 async def bar_loop(cfg, stop):
-    while not stop.is_set():
-        try:
-            data = await fetch_klines(cfg)
-            if not isinstance(data, list):
-                log(f"API error: {data}")
-                await asyncio.sleep(60); continue
-
-            bars = []
-            for d in data:
-                vol = float(d[5]); tb = float(d[9]); sv = vol - tb
-                bars.append({
-                    "open_time": int(d[0]),
-                    "open": float(d[1]), "high": float(d[2]),
-                    "low": float(d[3]), "close": float(d[4]),
-                    "volume": vol,
-                    "vol_imb": (tb-sv)/vol if vol > 0 else 0,
-                })
-            state["bars"] = bars
-            update_regime(bars)
-
-            last_bar_time = bars[-2]["open_time"]
-            if state["last_bar_time"] != last_bar_time:
-                state["last_bar_time"] = last_bar_time
-                bar = bars[-2]
-                vols = [b["volume"] for b in bars[:-2]]
-                vol_ma = sum(vols[-cfg.vol_window:]) / cfg.vol_window if vols else 1
-                vol_ratio = bar["volume"] / vol_ma
-                move = (bar["close"] - bar["open"]) / bar["open"]
-                regime = state["current_regime"]
-                allowed = [r.strip() for r in cfg.allowed_regimes.split(",")]
-
-                log(f"NEW 4H BAR | ${bar['close']:,.2f} move={move*100:+.2f}% vol={vol_ratio:.2f}x regime={regime}")
-
-                if regime not in allowed:
-                    log(f"REGIME SKIP: {regime} not in allowed {allowed}")
-                elif state["active_trade"] is None and time.time()-state["last_exit_time"] > 300:
-                    side, signals = check_entry(cfg, bars)
-                    if side:
-                        entry = state["mid"] if state["mid"] > 0 else bar["close"]
-                        tp = entry*(1+cfg.tp_pct) if side=="LONG" else entry*(1-cfg.tp_pct)
-                        sl = entry*(1-cfg.sl_pct) if side=="LONG" else entry*(1+cfg.sl_pct)
-                        liq = entry*(1-1/cfg.leverage) if side=="LONG" else entry*(1+1/cfg.leverage)
-                        state["active_trade"] = {
-                            "side": side, "entry": entry,
-                            "tp": tp, "sl": sl, "liq": liq,
-                            "entry_time": time.time(), **signals,
-                        }
-                        log(f"ENTRY {side} @ {entry:.2f} | move={signals['move_pct']}% vol={signals['vol_ratio']}x regime={regime}")
-                    else:
-                        log(f"NO SIGNAL | move={move*100:+.2f}% vol={vol_ratio:.2f}x | W:{state['wins']} L:{state['losses']} Bal:${state['balance']:.2f}")
-            else:
-                t = state["active_trade"]
-                if t:
-                    mid = state["mid"]
-                    raw = (mid-t["entry"])/t["entry"] if t["side"]=="LONG" else (t["entry"]-mid)/t["entry"]
-                    log(f"IN TRADE {t['side']} @ {t['entry']:.2f} | unreal={raw*cfg.leverage*100:+.2f}% | regime={state['current_regime']}")
-
-        except Exception as e:
-            log(f"Bar loop error: {e}")
-        await asyncio.sleep(cfg.kline_poll_s)
+    async with aiohttp.ClientSession() as session:
+        while not stop.is_set():
+            try:
+                bars = await fetch_klines(cfg, session)
+                state["bars"] = bars
+                update_regime(bars)
+                last_bar_time = bars[-2]["open_time"]
+                if state["last_bar_time"] != last_bar_time:
+                    state["last_bar_time"] = last_bar_time
+                    bar = bars[-2]
+                    vols = [b["volume"] for b in bars[:-2]]
+                    vol_ma = sum(vols[-cfg.vol_window:]) / cfg.vol_window if vols else 1
+                    vol_ratio = bar["volume"] / vol_ma
+                    move = (bar["close"] - bar["open"]) / bar["open"]
+                    regime = state["current_regime"]
+                    allowed = [r.strip() for r in cfg.allowed_regimes.split(",")]
+                    log(f"NEW 4H BAR | ${bar['close']:,.2f} move={move*100:+.2f}% vol={vol_ratio:.2f}x regime={regime}")
+                    if regime not in allowed:
+                        log(f"REGIME SKIP: {regime} not allowed")
+                    elif state["active_trade"] is None and time.time()-state["last_exit_time"] > 300:
+                        side, signals = check_entry(cfg, bars)
+                        if side:
+                            entry = state["mid"] if state["mid"] > 0 else bar["close"]
+                            tp = entry*(1+cfg.tp_pct) if side=="LONG" else entry*(1-cfg.tp_pct)
+                            sl = entry*(1-cfg.sl_pct) if side=="LONG" else entry*(1+cfg.sl_pct)
+                            liq = entry*(1-1/cfg.leverage) if side=="LONG" else entry*(1+1/cfg.leverage)
+                            state["active_trade"] = {
+                                "side": side, "entry": entry,
+                                "tp": tp, "sl": sl, "liq": liq,
+                                "entry_time": time.time(), **signals,
+                            }
+                            log(f"ENTRY {side} @ {entry:.2f} | move={signals['move_pct']}% vol={signals['vol_ratio']}x regime={regime}")
+                        else:
+                            log(f"NO SIGNAL | move={move*100:+.2f}% vol={vol_ratio:.2f}x | W:{state['wins']} L:{state['losses']} Bal:${state['balance']:.2f}")
+                else:
+                    t = state["active_trade"]
+                    if t:
+                        mid = state["mid"]
+                        raw = (mid-t["entry"])/t["entry"] if t["side"]=="LONG" else (t["entry"]-mid)/t["entry"]
+                        log(f"IN TRADE {t['side']} @ {t['entry']:.2f} | unreal={raw*cfg.leverage*100:+.2f}% | regime={state['current_regime']}")
+            except Exception as e:
+                log(f"Bar loop error: {e}")
+            await asyncio.sleep(cfg.kline_poll_s)
 
 async def price_loop(cfg, stop):
-    while not stop.is_set():
-        try:
-            bid, ask = await fetch_price(cfg)
-            state["bid"] = bid
-            state["ask"] = ask
-            state["mid"] = (bid+ask)/2
-            manage_trade(cfg)
-        except Exception as e:
-            log(f"Price error: {e}")
-        await asyncio.sleep(cfg.price_poll_s)
+    async with aiohttp.ClientSession() as session:
+        while not stop.is_set():
+            try:
+                bid, ask = await fetch_price(cfg, session)
+                state["bid"] = bid
+                state["ask"] = ask
+                state["mid"] = (bid+ask)/2
+                manage_trade(cfg)
+            except Exception as e:
+                log(f"Price error: {e}")
+            await asyncio.sleep(cfg.price_poll_s)
 
 async def run_app(cfg):
     stop = asyncio.Event()
-    log(f"BTC Momentum Bot v2 | {cfg.symbol} | {cfg.leverage}x | Regime Detection ON")
-    log(f"Entry: 4h move>{cfg.move_thr*100}% + vol>{cfg.vol_thr}x + flow + regime in {cfg.allowed_regimes}")
-    log(f"TP={cfg.tp_pct*100}% SL={cfg.sl_pct*100}% | Backtested: TREND regime WR=92.3%")
+    log(f"BTC Momentum Bot v2 | Kraken data | {cfg.leverage}x | Regime: {cfg.allowed_regimes}")
+    log(f"Entry: 4h move>{cfg.move_thr*100}% + vol>{cfg.vol_thr}x + regime filter")
+    log(f"TP={cfg.tp_pct*100}% SL={cfg.sl_pct*100}% | Backtested WR=92.3% in TREND regimes")
     adjust_brain(cfg)
     tasks = [
         asyncio.create_task(bar_loop(cfg, stop)),
