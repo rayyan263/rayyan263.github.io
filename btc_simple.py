@@ -94,6 +94,27 @@ def update_regime(bars):
         regime = "RANGING"
     state["current_regime"] = regime
 
+
+def kelly_position_size(trade_log, balance, tp_pct, sl_pct,
+                        min_pct=0.05, max_pct=0.20, default=50.0):
+    try:
+        if not os.path.exists(trade_log): return default
+        import csv as _csv
+        rows = []
+        with open(trade_log) as f:
+            for r in _csv.DictReader(f): rows.append(r)
+        if len(rows) < 10: return default
+        recent = rows[-20:]
+        wr = sum(1 for r in recent if float(r["pnl_$"])>0) / len(recent)
+        rr = tp_pct / sl_pct
+        kelly = wr - (1-wr)/rr
+        half_kelly = max(0, kelly*0.5)
+        pct = min(max(half_kelly, min_pct), max_pct)
+        size = round(balance * pct, 2)
+        return size
+    except:
+        return default
+
 async def fetch_klines(cfg, session):
     url = f"https://api.kraken.com/0/public/OHLC?pair={cfg.kraken_pair}&interval=240"
     async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
@@ -161,9 +182,10 @@ def manage_trade(cfg):
     if reason:
         raw = (ex-entry)/entry if side=="LONG" else (entry-ex)/entry
         net = max(raw*cfg.leverage - cfg.taker_fee_rate*2, -1.0)
-        pnl = net * cfg.trade_size
+        trade_size = t.get('trade_size', cfg.trade_size)
+        pnl = net * trade_size
         state["balance"] += pnl
-        state["fees_paid"] += cfg.taker_fee_rate*2*cfg.trade_size
+        state["fees_paid"] += cfg.taker_fee_rate*2*trade_size
         if pnl > 0: state["wins"] += 1
         else: state["losses"] += 1
         state["last_exit_time"] = time.time()
@@ -179,7 +201,7 @@ def manage_trade(cfg):
             "levered_pct": round(raw*cfg.leverage*100, 4),
             "net_pnl": round(net, 6),
             "pnl_$": round(pnl, 4),
-            "fees_$": round(cfg.taker_fee_rate*2*cfg.trade_size, 4),
+            "fees_$": round(cfg.taker_fee_rate*2*trade_size, 4),
             "move_pct": t.get("move_pct", 0),
             "vol_ratio": t.get("vol_ratio", 0),
             "regime": t.get("regime", "UNKNOWN"),
@@ -237,11 +259,17 @@ async def bar_loop(cfg, stop):
                             tp = entry*(1+cfg.tp_pct) if side=="LONG" else entry*(1-cfg.tp_pct)
                             sl = entry*(1-cfg.sl_pct) if side=="LONG" else entry*(1+cfg.sl_pct)
                             liq = entry*(1-1/cfg.leverage) if side=="LONG" else entry*(1+1/cfg.leverage)
+                            trade_size = kelly_position_size(
+                                cfg.trade_log, state["balance"],
+                                cfg.tp_pct, cfg.sl_pct
+                            )
                             state["active_trade"] = {
                                 "side": side, "entry": entry,
                                 "tp": tp, "sl": sl, "liq": liq,
-                                "entry_time": time.time(), **signals,
+                                "entry_time": time.time(),
+                                "trade_size": trade_size, **signals,
                             }
+                            log(f"Kelly size: ${trade_size:.2f}")
                             log(f"ENTRY {side} @ {entry:.2f} | move={signals['move_pct']}% vol={signals['vol_ratio']}x regime={regime}")
                         else:
                             log(f"NO SIGNAL | move={move*100:+.2f}% vol={vol_ratio:.2f}x | W:{state['wins']} L:{state['losses']} Bal:${state['balance']:.2f}")
