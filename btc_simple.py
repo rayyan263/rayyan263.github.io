@@ -338,10 +338,10 @@ async def bar_loop(cfg, stop):
                     log(f"NEW 1H BAR | ${bar['close']:,.2f} move={move*100:+.2f}% vol={state['vol_ratio']}x RSI={state['rsi']} BB%={state['bb_pct']} regime={regime}")
 
                     if state["active_trade"] is None and time.time()-state["last_exit_time"] > 120:
-                        # Try momentum first
-                        side, signals = check_momentum(cfg, bars)
-                        strategy_type = "MOMENTUM"
-
+                        # Momentum disabled - no real edge on BTC (4yr backtest)
+                        side = None
+                        signals = {}
+                        strategy_type = "MEAN_REV"
                         # If no momentum signal try mean reversion
                         if side is None:
                             side, signals = check_mean_reversion(cfg, bars)
